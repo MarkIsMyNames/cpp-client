@@ -10,10 +10,14 @@
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <mutex>
+#include <openssl/bn.h>
 #include <openssl/crypto.h>
+#include <openssl/ec.h>
+#include <openssl/obj_mac.h>
 #include <ranges>
 #include <set>
 #include <sstream>
@@ -102,6 +106,7 @@ struct AppState {
   std::string ethPrivateKey;     // hex, with or without 0x prefix
   std::string ethContractAddr;   // 0x-prefixed 20-byte address
   std::string ethRpcUrl{"https://rpc.sepolia.org"};
+  std::string ethWalletAddr;     // explicit sender address (overrides derivation from private key)
 
   std::shared_ptr<std::vector<std::string>> allLabels =
       std::make_shared<std::vector<std::string>>();
@@ -472,6 +477,33 @@ Component makeLoginScreen(AppState &state, ScreenInteractive &scr,
                   state.ethContractAddr = cfg["contract_address"].get<std::string>();
                 if (cfg.contains("rpc_url"))
                   state.ethRpcUrl = cfg["rpc_url"].get<std::string>();
+                if (cfg.contains("wallet_address"))
+                  state.ethWalletAddr = cfg["wallet_address"].get<std::string>();
+                // Log derived address so it can be verified
+                if (!state.ethPrivateKey.empty()) {
+                  try {
+                    auto privBytes = BlockchainManager::fromHex0x(state.ethPrivateKey);
+                    // ethAddr is in an anonymous namespace; re-derive via recordOnChain path
+                    // by calling the public bundleHash path to force a compile check,
+                    // but we need the address — expose it through a small inline derivation here.
+                    BN_CTX* actx = BN_CTX_new();
+                    EC_GROUP* agrp = EC_GROUP_new_by_curve_name(NID_secp256k1);
+                    BIGNUM* apriv = BN_bin2bn(privBytes.data(), 32, nullptr);
+                    EC_POINT* apub = EC_POINT_new(agrp);
+                    EC_POINT_mul(agrp, apub, apriv, nullptr, nullptr, actx);
+                    std::vector<uint8_t> araw(65);
+                    EC_POINT_point2oct(agrp, apub, POINT_CONVERSION_UNCOMPRESSED, araw.data(), 65, actx);
+                    EC_POINT_free(apub); BN_free(apriv); EC_GROUP_free(agrp); BN_CTX_free(actx);
+                    auto ah = BlockchainManager::keccak256(std::vector<uint8_t>(araw.begin() + 1, araw.end()));
+                    std::ostringstream addrSS;
+                    addrSS << "0x";
+                    for (int i = 12; i < 32; ++i)
+                      addrSS << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(ah[i]);
+                    appendLog("[chain] derived wallet address: " + addrSS.str() + "\n");
+                  } catch (const std::exception& e) {
+                    appendLog("[chain] address derivation failed: " + std::string(e.what()) + "\n");
+                  }
+                }
               }
             } catch (...) {}
           }
@@ -903,6 +935,7 @@ Component makeMainScreen(AppState &state, ScreenInteractive &scr,
         std::string segFile;
         int segIdx{0};
         SegmentDigest digest;
+        std::string bundleHash;
       };
       std::optional<PendingRecord> pending;
 
@@ -951,7 +984,7 @@ Component makeMainScreen(AppState &state, ScreenInteractive &scr,
                   "  hash: " + digest.segmentHash.substr(0, 16) + "...";
               if (!state.ethPrivateKey.empty() && !state.ethContractAddr.empty()) {
                 state.chainVerifyStatus += "  submitting to Sepolia...";
-                pending = PendingRecord{segFile, segIdx, std::move(digest)};
+                pending = PendingRecord{segFile, segIdx, std::move(digest), onChainHash};
               } else {
                 state.chainVerifyStatus += "  (add eth_config.json to record on chain)";
               }
@@ -973,23 +1006,31 @@ Component makeMainScreen(AppState &state, ScreenInteractive &scr,
       if (pending) {
         try {
           const auto txHash = BlockchainManager::recordOnChain(
-              pending->digest.segmentHash,
+              pending->bundleHash,
               state.ethContractAddr,
               state.ethPrivateKey,
               state.ethRpcUrl,
-              11155111);
-          state.chainVerifyStatus =
-              "Block " + std::to_string(pending->segIdx) +
-              " recorded  tx: " + txHash.substr(0, 18) + "..." +
-              "  file: " + pending->segFile;
-          appendLog("[chain] block " + std::to_string(pending->segIdx) +
-                    " tx=" + txHash + "\n");
+              11155111,
+              state.ethWalletAddr);
+          const bool failed = txHash.rfind("FAIL:", 0) == 0;
+          if (failed) {
+            state.chainVerifyStatus =
+                "Block " + std::to_string(pending->segIdx) + " chain error (see log)";
+            appendLog("[chain] block " + std::to_string(pending->segIdx) +
+                      " error: " + txHash + "\n");
+          } else {
+            state.chainVerifyStatus =
+                "Block " + std::to_string(pending->segIdx) +
+                " recorded  tx: " + txHash.substr(0, 18) + "..." +
+                "  file: " + pending->segFile;
+            appendLog("[chain] block " + std::to_string(pending->segIdx) +
+                      " tx=" + txHash + "\n");
+          }
         } catch (const std::exception& ex) {
           state.chainVerifyStatus =
-              "Block " + std::to_string(pending->segIdx) +
-              " saved: " + pending->segFile +
-              "  (chain error: " + std::string(ex.what()) + ")";
-          appendLog("[chain] error: " + std::string(ex.what()) + "\n");
+              "Block " + std::to_string(pending->segIdx) + " chain error (see log)";
+          appendLog("[chain] block " + std::to_string(pending->segIdx) +
+                    " exception: " + std::string(ex.what()) + "\n");
         }
       }
 

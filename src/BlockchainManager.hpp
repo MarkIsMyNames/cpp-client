@@ -68,7 +68,8 @@ public:
                                      const std::string& contractAddress,
                                      const std::string& privateKeyHex,
                                      const std::string& rpcUrl,
-                                     int chainId = 11155111);
+                                     int chainId = 11155111,
+                                     const std::string& senderAddressHex = {});
 
     static std::string              toHex0x(const std::vector<uint8_t>& data);
     static std::vector<uint8_t>     fromHex0x(const std::string& hex);

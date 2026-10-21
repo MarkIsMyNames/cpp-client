@@ -14,96 +14,128 @@
 #include <openssl/bn.h>
 #include <ctime>
 
+static void chainLog(const std::string& msg) {
+    std::ofstream("securemsg.log", std::ios::app) << "[chain-diag] " << msg << "\n";
+}
+
+static std::string hexStr(const std::vector<uint8_t>& v) {
+    std::ostringstream ss;
+    for (uint8_t b : v) ss << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+    return ss.str();
+}
+
 // ── Keccak-256 ────────────────────────────────────────────────────────────────
 //
-// This is the original Keccak-256 used by Ethereum.  It differs from NIST
-// SHA3-256 only in the padding byte: Keccak uses 0x01; SHA3 uses 0x06.
-// OpenSSL's EVP_sha3_256() applies the NIST padding and therefore cannot be
-// used here.
+// Reference implementation by Markku-Juhani O. Saarinen (public domain).
+// Uses the piln/rotc lane-traversal approach from tiny_sha3.
+// Keccak-256 differs from NIST SHA3-256 only in the padding delimiter (0x01 vs 0x06).
 
 namespace {
 
-static const uint64_t KECCAK_RC[24] = {
-    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808AULL,
-    0x8000000080008000ULL, 0x000000000000808BULL, 0x0000000080000001ULL,
-    0x8000000080008081ULL, 0x8000000000008009ULL, 0x000000000000008AULL,
-    0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000AULL,
-    0x000000008000808BULL, 0x800000000000008BULL, 0x8000000000008089ULL,
+static const uint64_t keccak_rc[24] = {
+    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL,
+    0x8000000080008000ULL, 0x000000000000808bULL, 0x0000000080000001ULL,
+    0x8000000080008081ULL, 0x8000000000008009ULL, 0x000000000000008aULL,
+    0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
+    0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL,
     0x8000000000008003ULL, 0x8000000000008002ULL, 0x8000000000000080ULL,
-    0x000000000000800AULL, 0x800000008000000AULL, 0x8000000080008081ULL,
+    0x000000000000800aULL, 0x800000008000000aULL, 0x8000000080008081ULL,
     0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
 };
 
-// Rotation offsets for Rho step (indexed by [x][y]).
-static const int KECCAK_ROT[5][5] = {
-    { 0, 36,  3, 41, 18},
-    { 1, 44, 10, 45,  2},
-    {62,  6, 43, 15, 61},
-    {28, 55, 25, 21, 56},
-    {27, 20, 39,  8, 14}
+static const int keccak_rotc[24] = {
+     1,  3,  6, 10, 15, 21, 28, 36, 45, 55,  2, 14,
+    27, 41, 56,  8, 25, 43, 62, 18, 39, 61, 20, 44
 };
 
-static inline uint64_t rol64(uint64_t x, int n) {
+static const int keccak_piln[24] = {
+    10,  7, 11, 17, 18,  3,  5, 16,  8, 21, 24,  4,
+    15, 23, 19, 13, 12,  2, 20, 14, 22,  9,  6,  1
+};
+
+static inline uint64_t rotl64(uint64_t x, int n) {
     return (x << n) | (x >> (64 - n));
 }
 
-static void keccakF1600(uint64_t A[25]) {
-    for (int round = 0; round < 24; ++round) {
+static void keccakf1600(uint64_t st[25]) {
+    uint64_t bc[5], t;
+    for (int r = 0; r < 24; ++r) {
         // Theta
-        uint64_t C[5], D[5];
-        for (int x = 0; x < 5; ++x)
-            C[x] = A[x] ^ A[x+5] ^ A[x+10] ^ A[x+15] ^ A[x+20];
-        for (int x = 0; x < 5; ++x)
-            D[x] = C[(x+4)%5] ^ rol64(C[(x+1)%5], 1);
-        for (int i = 0; i < 25; ++i)
-            A[i] ^= D[i % 5];
-
+        for (int i = 0; i < 5; ++i)
+            bc[i] = st[i] ^ st[i+5] ^ st[i+10] ^ st[i+15] ^ st[i+20];
+        for (int i = 0; i < 5; ++i) {
+            t = bc[(i+4)%5] ^ rotl64(bc[(i+1)%5], 1);
+            for (int j = 0; j < 25; j += 5) st[j+i] ^= t;
+        }
         // Rho + Pi
-        uint64_t B[25];
-        for (int x = 0; x < 5; ++x)
-            for (int y = 0; y < 5; ++y)
-                B[y*5 + (2*x+3*y)%5] = rol64(A[x + y*5], KECCAK_ROT[x][y]);
-
+        t = st[1];
+        for (int i = 0; i < 24; ++i) {
+            int j = keccak_piln[i];
+            bc[0] = st[j];
+            st[j] = rotl64(t, keccak_rotc[i]);
+            t = bc[0];
+        }
         // Chi
-        for (int x = 0; x < 5; ++x)
-            for (int y = 0; y < 5; ++y)
-                A[x + y*5] = B[x + y*5] ^ ((~B[(x+1)%5 + y*5]) & B[(x+2)%5 + y*5]);
-
+        for (int j = 0; j < 25; j += 5) {
+            for (int i = 0; i < 5; ++i) bc[i] = st[j+i];
+            for (int i = 0; i < 5; ++i) st[j+i] ^= (~bc[(i+1)%5]) & bc[(i+2)%5];
+        }
         // Iota
-        A[0] ^= KECCAK_RC[round];
+        st[0] ^= keccak_rc[r];
     }
 }
 
 } // anonymous namespace
 
 std::vector<uint8_t> BlockchainManager::keccak256(const std::vector<uint8_t>& data) {
-    constexpr int RATE = 136; // (1600 - 2*256) / 8 bytes
+    constexpr int RATE = 136; // (1600 - 2*256) / 8
 
-    // Pad: append 0x01, then zeros, then set high bit of last byte.
-    std::vector<uint8_t> padded = data;
-    padded.push_back(0x01);
-    while (static_cast<int>(padded.size()) % RATE != 0)
-        padded.push_back(0x00);
-    padded.back() |= 0x80;
+    uint64_t st[25] = {};
+    std::size_t pos = 0;
+    const uint8_t* in = data.data();
+    std::size_t inlen = data.size();
 
-    uint64_t state[25] = {};
-
-    // Absorb
-    for (std::size_t i = 0; i < padded.size(); i += RATE) {
-        for (int j = 0; j < RATE / 8; ++j) {
-            uint64_t word = 0;
-            for (int k = 0; k < 8; ++k)
-                word |= static_cast<uint64_t>(padded[i + j*8 + k]) << (k * 8);
-            state[j] ^= word;
+    // Absorb full blocks
+    while (inlen >= static_cast<std::size_t>(RATE)) {
+        for (int i = 0; i < RATE / 8; ++i) {
+            uint64_t w = 0;
+            std::memcpy(&w, in + i*8, 8);
+            st[i] ^= w;
         }
-        keccakF1600(state);
+        keccakf1600(st);
+        in += RATE; inlen -= RATE;
     }
 
-    // Squeeze first 32 bytes
+    // Absorb last partial block with Keccak padding (0x01 ... 0x80)
+    uint8_t last[RATE] = {};
+    std::memcpy(last, in, inlen);
+    last[inlen]      ^= 0x01;
+    last[RATE - 1]   ^= 0x80;
+    for (int i = 0; i < RATE / 8; ++i) {
+        uint64_t w = 0;
+        std::memcpy(&w, last + i*8, 8);
+        st[i] ^= w;
+    }
+    keccakf1600(st);
+    (void)pos;
+
+    // Squeeze first 32 bytes (little-endian lanes)
     std::vector<uint8_t> hash(32);
-    for (int i = 0; i < 4; ++i)
-        for (int k = 0; k < 8; ++k)
-            hash[i*8 + k] = static_cast<uint8_t>((state[i] >> (k * 8)) & 0xFF);
+    for (int i = 0; i < 32 / 8; ++i)
+        std::memcpy(hash.data() + i*8, &st[i], 8);
+
+    // Self-test on first call: keccak256("") must equal the known vector
+    static bool tested = false;
+    if (!tested) {
+        tested = true;
+        static const uint8_t expected[32] = {
+            0xc5,0xd2,0x46,0x01,0x86,0xf7,0x23,0x3c,0x92,0x7e,0x7d,0xb2,0xdc,0xc7,0x03,0xc0,
+            0xe5,0x00,0xb6,0x53,0xca,0x82,0x27,0x3b,0x7b,0xfa,0xd8,0x04,0x5d,0x85,0xa4,0x70
+        };
+        auto chk = keccak256(std::vector<uint8_t>{});
+        bool ok = std::equal(chk.begin(), chk.end(), expected);
+        chainLog(std::string("keccak256 self-test: ") + (ok ? "PASS" : "FAIL got " + hexStr(chk)));
+    }
 
     return hash;
 }
@@ -526,13 +558,21 @@ static std::vector<uint8_t> rlpL(const std::vector<std::vector<uint8_t>>& items)
 // Derive Ethereum address (20 bytes) from a 32-byte secp256k1 private key
 static std::vector<uint8_t> ethAddr(const std::vector<uint8_t>& priv32) {
     BN_CTX* ctx = BN_CTX_new();
+    if (!ctx) throw std::runtime_error("ethAddr: BN_CTX_new failed");
     EC_GROUP* grp = EC_GROUP_new_by_curve_name(NID_secp256k1);
+    if (!grp) { BN_CTX_free(ctx); throw std::runtime_error("ethAddr: secp256k1 curve unavailable"); }
     BIGNUM* priv = BN_bin2bn(priv32.data(), 32, nullptr);
+    if (!priv) { EC_GROUP_free(grp); BN_CTX_free(ctx); throw std::runtime_error("ethAddr: BN_bin2bn failed"); }
     EC_POINT* pub = EC_POINT_new(grp);
-    EC_POINT_mul(grp, pub, priv, nullptr, nullptr, ctx);
+    if (!pub) { BN_free(priv); EC_GROUP_free(grp); BN_CTX_free(ctx); throw std::runtime_error("ethAddr: EC_POINT_new failed"); }
+    if (!EC_POINT_mul(grp, pub, priv, nullptr, nullptr, ctx)) {
+        EC_POINT_free(pub); BN_free(priv); EC_GROUP_free(grp); BN_CTX_free(ctx);
+        throw std::runtime_error("ethAddr: EC_POINT_mul failed");
+    }
     std::vector<uint8_t> raw(65);
-    EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, raw.data(), 65, ctx);
-    EC_POINT_free(pub); EC_GROUP_free(grp); BN_free(priv); BN_CTX_free(ctx);
+    size_t written = EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, raw.data(), 65, ctx);
+    EC_POINT_free(pub); BN_free(priv); EC_GROUP_free(grp); BN_CTX_free(ctx);
+    if (written != 65) throw std::runtime_error("ethAddr: EC_POINT_point2oct failed (wrote " + std::to_string(written) + " bytes)");
     auto h = BlockchainManager::keccak256(std::vector<uint8_t>(raw.begin() + 1, raw.end()));
     return {h.begin() + 12, h.end()};
 }
@@ -631,7 +671,8 @@ std::string BlockchainManager::recordOnChain(
     const std::string& contractAddress,
     const std::string& privateKeyHex,
     const std::string& rpcUrl,
-    int chainId)
+    int chainId,
+    const std::string& senderAddressHex)
 {
     try {
         // Parse inputs
@@ -642,13 +683,23 @@ std::string BlockchainManager::recordOnChain(
         auto hashBytes = fromHex0x(bundleHashHex);
         if (hashBytes.size() != 32) throw std::invalid_argument("Bundle hash must be 32 bytes");
 
-        // Derive sender address for nonce lookup
-        auto senderBytes = ethAddr(privKey);
-        std::ostringstream senderSS;
-        senderSS << "0x";
-        for (uint8_t b : senderBytes)
-            senderSS << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
-        const std::string senderHex = senderSS.str();
+        // Use provided sender address for nonce lookup, or derive from private key
+        std::vector<uint8_t> senderBytes;
+        std::string senderHex;
+        if (!senderAddressHex.empty()) {
+            senderBytes = fromHex0x(senderAddressHex);
+            if (senderBytes.size() != 20) throw std::invalid_argument("Sender address must be 20 bytes");
+            senderHex = senderAddressHex;
+            if (senderHex.size() < 2 || senderHex[1] != 'x')
+                senderHex = "0x" + senderHex;
+        } else {
+            senderBytes = ethAddr(privKey);
+            std::ostringstream senderSS;
+            senderSS << "0x";
+            for (uint8_t b : senderBytes)
+                senderSS << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+            senderHex = senderSS.str();
+        }
 
         // eth_getTransactionCount
         nlohmann::json nonceReq;
@@ -668,13 +719,31 @@ std::string BlockchainManager::recordOnChain(
         // Build EC key — used for both the message signature and the tx signature.
         BN_CTX* ctx = BN_CTX_new();
         EC_GROUP* grp = EC_GROUP_new_by_curve_name(NID_secp256k1);
+        chainLog("EC_GROUP_new_by_curve_name(secp256k1): " + std::string(grp ? "ok" : "FAILED/NULL"));
         EC_KEY* key = EC_KEY_new();
         EC_KEY_set_group(key, grp);
         BIGNUM* privBn = BN_bin2bn(privKey.data(), 32, nullptr);
         EC_KEY_set_private_key(key, privBn);
         EC_POINT* pubPt = EC_POINT_new(grp);
-        EC_POINT_mul(grp, pubPt, privBn, nullptr, nullptr, ctx);
+        int mulOk = EC_POINT_mul(grp, pubPt, privBn, nullptr, nullptr, ctx);
+        chainLog("EC_POINT_mul: " + std::string(mulOk ? "ok" : "FAILED"));
         EC_KEY_set_public_key(key, pubPt);
+
+        // Log public key bytes to diagnose address derivation
+        {
+            std::vector<uint8_t> pubRaw(65);
+            size_t written = EC_POINT_point2oct(grp, pubPt, POINT_CONVERSION_UNCOMPRESSED, pubRaw.data(), 65, ctx);
+            chainLog("EC_POINT_point2oct wrote " + std::to_string(written) + " bytes");
+            if (written == 65) {
+                chainLog("pubkey prefix byte: 0x" + toHex0x({pubRaw[0]}).substr(2));
+                chainLog("pubkey X: " + toHex0x({pubRaw.begin()+1,  pubRaw.begin()+33}).substr(2));
+                chainLog("pubkey Y: " + toHex0x({pubRaw.begin()+33, pubRaw.end()}).substr(2));
+                auto addrHash = keccak256(std::vector<uint8_t>(pubRaw.begin()+1, pubRaw.end()));
+                chainLog("keccak256(pubkey): " + toHex0x(addrHash).substr(2));
+                chainLog("derived address:   0x" + toHex0x({addrHash.begin()+12, addrHash.end()}).substr(2));
+                chainLog("expected address:  " + senderHex);
+            }
+        }
 
         // Sign the EIP-191 hash for the `bytes signature` parameter.
         // Solidity verifies MessageHashUtils.toEthSignedMessageHash(hash).
@@ -706,6 +775,9 @@ std::string BlockchainManager::recordOnChain(
             for (int rid = 0; rid < 2; ++rid) {
                 auto rp = ecRecover(personalHash, mr32, ms32, rid);
                 auto rh = keccak256(rp);
+                std::string recovAddr = "0x" + toHex0x({rh.begin()+12, rh.end()}).substr(2);
+                chainLog("msg recId=" + std::to_string(rid) + " recovers to " + recovAddr +
+                         (std::equal(rh.begin()+12, rh.end(), senderBytes.begin()) ? " MATCH" : " no match"));
                 if (std::equal(rh.begin() + 12, rh.end(), senderBytes.begin()))
                 { mrid = rid; break; }
             }
